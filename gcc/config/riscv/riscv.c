@@ -1,5 +1,5 @@
 /* Subroutines used for code generation for RISC-V.
-   Copyright (C) 2011-2017 Free Software Foundation, Inc.
+   Copyright (C) 2011-2018 Free Software Foundation, Inc.
    Contributed by Andrew Waterman (andrew@sifive.com).
    Based on MIPS target for GNU compiler.
 
@@ -177,8 +177,8 @@ struct GTY(())  machine_function {
      This area is allocated by the callee at the very top of the frame.  */
   int varargs_size;
 
-  /* Memoized return value of leaf_function_p.  <0 if false, >0 if true.  */
-  int is_leaf;
+  /* True if current function is a naked function.  */
+  bool naked_p;
 
   /* The current frame information, calculated by riscv_compute_frame_info.  */
   struct riscv_frame_info frame;
@@ -320,6 +320,19 @@ static const struct riscv_tune_info optimize_size_tune_info = {
   1,						/* branch_cost */
   2,						/* memory_cost */
   false,					/* slow_unaligned_access */
+};
+
+/* Defining target-specific uses of __attribute__.  */
+static const struct attribute_spec riscv_attribute_table[] =
+{
+  /* Syntax: { name, min_len, max_len, decl_required, type_required,
+	       function_type_required, handler, affects_type_identity } */
+
+  /* The attribute telling no prologue/epilogue.  */
+  { "naked",	0,  0, true, false, false, NULL, false },
+
+  /* The last attribute spec is set to be NULL.  */
+  { NULL,	0,  0, false, false, false, NULL, false }
 };
 
 /* A table describing all the processors GCC knows about.  */
@@ -1852,6 +1865,16 @@ riscv_output_move (rtx dest, rtx src)
     }
   gcc_unreachable ();
 }
+
+const char *
+riscv_output_return ()
+{
+  if (cfun->machine->naked_p)
+    return "";
+
+  return "ret";
+}
+
 
 /* Return true if CMP1 is a suitable second operand for integer ordering
    test CODE.  See also the *sCC patterns in riscv.md.  */
@@ -2672,6 +2695,33 @@ riscv_setup_incoming_varargs (cumulative_args_t cum, enum machine_mode mode,
     cfun->machine->varargs_size = gp_saved * UNITS_PER_WORD;
 }
 
+/* Return true if func is a naked function.  */
+static bool
+riscv_naked_function_p (tree func)
+{
+  tree func_decl = func;
+  if (func == NULL_TREE)
+    func_decl = current_function_decl;
+  return NULL_TREE != lookup_attribute ("naked", DECL_ATTRIBUTES (func_decl));
+}
+
+/* Implement TARGET_ALLOCATE_STACK_SLOTS_FOR_ARGS.  */
+static bool
+riscv_allocate_stack_slots_for_args ()
+{
+  /* Naked functions should not allocate stack slots for arguments.  */
+  return !riscv_naked_function_p (current_function_decl);
+}
+
+/* Implement TARGET_WARN_FUNC_RETURN.  */
+static bool
+riscv_warn_func_return (tree decl)
+{
+  /* Naked functions are implemented entirely in assembly, including the
+     return sequence, so suppress warnings about this.  */
+  return !riscv_naked_function_p (decl);
+}
+
 /* Implement TARGET_EXPAND_BUILTIN_VA_START.  */
 
 static void
@@ -3211,23 +3261,26 @@ riscv_compute_frame_info (void)
   frame = &cfun->machine->frame;
   memset (frame, 0, sizeof (*frame));
 
-  /* Find out which GPRs we need to save.  */
-  for (regno = GP_REG_FIRST; regno <= GP_REG_LAST; regno++)
-    if (riscv_save_reg_p (regno))
-      frame->mask |= 1 << (regno - GP_REG_FIRST), num_x_saved++;
+  if (!cfun->machine->naked_p)
+    {
+      /* Find out which GPRs we need to save.  */
+      for (regno = GP_REG_FIRST; regno <= GP_REG_LAST; regno++)
+	if (riscv_save_reg_p (regno))
+	  frame->mask |= 1 << (regno - GP_REG_FIRST), num_x_saved++;
 
-  /* If this function calls eh_return, we must also save and restore the
-     EH data registers.  */
-  if (crtl->calls_eh_return)
-    for (i = 0; (regno = EH_RETURN_DATA_REGNO (i)) != INVALID_REGNUM; i++)
-      frame->mask |= 1 << (regno - GP_REG_FIRST), num_x_saved++;
+      /* If this function calls eh_return, we must also save and restore the
+	 EH data registers.  */
+      if (crtl->calls_eh_return)
+	for (i = 0; (regno = EH_RETURN_DATA_REGNO (i)) != INVALID_REGNUM; i++)
+	  frame->mask |= 1 << (regno - GP_REG_FIRST), num_x_saved++;
 
-  /* Find out which FPRs we need to save.  This loop must iterate over
-     the same space as its companion in riscv_for_each_saved_reg.  */
-  if (TARGET_HARD_FLOAT)
-    for (regno = FP_REG_FIRST; regno <= FP_REG_LAST; regno++)
-      if (riscv_save_reg_p (regno))
-	frame->fmask |= 1 << (regno - FP_REG_FIRST), num_f_saved++;
+      /* Find out which FPRs we need to save.  This loop must iterate over
+	 the same space as its companion in riscv_for_each_saved_reg.  */
+      if (TARGET_HARD_FLOAT)
+	for (regno = FP_REG_FIRST; regno <= FP_REG_LAST; regno++)
+	  if (riscv_save_reg_p (regno))
+	    frame->fmask |= 1 << (regno - FP_REG_FIRST), num_f_saved++;
+    }
 
   /* At the bottom of the frame are any outgoing stack arguments. */
   offset = crtl->outgoing_args_size;
@@ -3497,6 +3550,14 @@ riscv_expand_prologue (void)
   unsigned mask = frame->mask;
   rtx insn;
 
+  if (cfun->machine->naked_p)
+    {
+      if (flag_stack_usage_info)
+	current_function_static_stack_size = 0;
+
+      return;
+    }
+
   if (flag_stack_usage_info)
     current_function_static_stack_size = size;
 
@@ -3608,6 +3669,15 @@ riscv_expand_epilogue (bool sibcall_p)
   /* We need to add memory barrier to prevent read from deallocated stack.  */
   bool need_barrier_p = (get_frame_size ()
 			 + cfun->machine->frame.arg_pointer_offset) != 0;
+
+  if (cfun->machine->naked_p)
+    {
+      gcc_assert (!sibcall_p);
+
+      emit_jump_insn (gen_return ());
+
+      return;
+    }
 
   if (!sibcall_p && riscv_can_use_return_insn ())
     {
@@ -4156,28 +4226,35 @@ riscv_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
   emit_insn (gen_clear_cache (addr, end_addr));
 }
 
-/* Return leaf_function_p () and memoize the result.  */
-
-static bool
-riscv_leaf_function_p (void)
-{
-  if (cfun->machine->is_leaf == 0)
-    cfun->machine->is_leaf = leaf_function_p () ? 1 : -1;
-
-  return cfun->machine->is_leaf > 0;
-}
-
 /* Implement TARGET_FUNCTION_OK_FOR_SIBCALL.  */
 
 static bool
 riscv_function_ok_for_sibcall (tree decl ATTRIBUTE_UNUSED,
 			       tree exp ATTRIBUTE_UNUSED)
 {
-  /* When optimzing for size, don't use sibcalls in non-leaf routines */
+  /* Don't use sibcalls when use save-restore routine.  */
   if (TARGET_SAVE_RESTORE)
-    return riscv_leaf_function_p ();
+    return false;
+
+  /* Don't use sibcall for naked function.  */
+  if (cfun->machine->naked_p)
+    return false;
 
   return true;
+}
+
+/* Implement `TARGET_SET_CURRENT_FUNCTION'.  */
+/* Sanity cheching for above function attributes.  */
+static void
+riscv_set_current_function (tree decl)
+{
+  if (decl == NULL_TREE
+      || current_function_decl == NULL_TREE
+      || current_function_decl == error_mark_node
+      || !cfun->machine)
+    return;
+
+  cfun->machine->naked_p = riscv_naked_function_p (decl);
 }
 
 /* Implement TARGET_CANNOT_COPY_INSN_P.  */
@@ -4207,6 +4284,9 @@ riscv_cannot_copy_insn_p (rtx_insn *insn)
 
 #undef TARGET_FUNCTION_OK_FOR_SIBCALL
 #define TARGET_FUNCTION_OK_FOR_SIBCALL riscv_function_ok_for_sibcall
+
+#undef  TARGET_SET_CURRENT_FUNCTION
+#define TARGET_SET_CURRENT_FUNCTION riscv_set_current_function
 
 #undef TARGET_REGISTER_MOVE_COST
 #define TARGET_REGISTER_MOVE_COST riscv_register_move_cost
@@ -4243,6 +4323,8 @@ riscv_cannot_copy_insn_p (rtx_insn *insn)
 
 #undef TARGET_SETUP_INCOMING_VARARGS
 #define TARGET_SETUP_INCOMING_VARARGS riscv_setup_incoming_varargs
+#undef TARGET_ALLOCATE_STACK_SLOTS_FOR_ARGS
+#define TARGET_ALLOCATE_STACK_SLOTS_FOR_ARGS riscv_allocate_stack_slots_for_args
 #undef TARGET_STRICT_ARGUMENT_NAMING
 #define TARGET_STRICT_ARGUMENT_NAMING hook_bool_CUMULATIVE_ARGS_true
 #undef TARGET_MUST_PASS_IN_STACK
@@ -4317,6 +4399,12 @@ riscv_cannot_copy_insn_p (rtx_insn *insn)
 
 #undef TARGET_EXPAND_BUILTIN
 #define TARGET_EXPAND_BUILTIN riscv_expand_builtin
+
+#undef TARGET_ATTRIBUTE_TABLE
+#define TARGET_ATTRIBUTE_TABLE riscv_attribute_table
+
+#undef TARGET_WARN_FUNC_RETURN
+#define TARGET_WARN_FUNC_RETURN riscv_warn_func_return
 
 struct gcc_target targetm = TARGET_INITIALIZER;
 

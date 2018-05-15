@@ -1,3 +1,24 @@
+2017-11-07  Eric Botcazou  <ebotcazou@adacore.com>
+
+	Backport from mainline
+	2017-10-31  Matthew Fortune  <matthew.fortune@imgtec.com>
+                    Eric Botcazou  <ebotcazou@adacore.com>
+
+	PR rtl-optimization/81803
+	* lra-constraints.c (curr_insn_transform): Also reload the whole
+	register for a strict subreg no wider than a word if this is for
+	a WORD_REGISTER_OPERATIONS target.
+
+2018-01-08  Jim Wilson  <jimw@sifive.com>
+
+	Backport from mainline
+	2018-01-08  Monk Chiang  <sh.chiang04@gmail.com>
+		    Kito Cheng  <kito.cheng@gmail.com>
+
+	* config/riscv/riscv.c (machine_function::is_leaf): Remove field.
+	(riscv_leaf_function_p): Delete.
+	(riscv_function_ok_for_sibcall): Return false when TARGET_SAVE_RESTORE.
+
 2017-11-07  Andrew Waterman  <andrew@sifive.com>
 
 	* config/riscv/riscv-protos.h (riscv_hard_regno_nregs): New
